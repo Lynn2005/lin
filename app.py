@@ -126,23 +126,30 @@ def _run_job(job_id: str, video_path: Path, burn_subtitles: bool) -> None:
         audio_path = folder / "source-audio.mp3"
         _set_job(job_id, 10, "Video ကနေ audio extract လုပ်နေသည်…")
         _run([ffmpeg, "-y", "-i", str(video_path), "-vn", "-ac", "1", "-ar", "16000", "-b:a", "48k", str(audio_path)])
-        if audio_path.stat().st_size > 24 * 1024 * 1024:
-            raise RuntimeError("Extracted audio သည် transcription API limit ထက်ကြီးနေပါတယ်။ ပိုတိုသော video ဖြင့် စမ်းပါ။")
-        _set_job(job_id, 22, "Groq Whisper နဲ့ transcript ထုတ်နေသည်…")
-        with audio_path.open("rb") as af:
-            transcript = client.audio.transcriptions.create(file=(audio_path.name, af.read()), model=STT_MODEL, response_format="verbose_json", timestamp_granularities=["segment"])
-        raw_segments = getattr(transcript, "segments", None) or []
+        _set_job(job_id, 22, "Groq Whisper နဲ့ audio ကို အပိုင်းလိုက် transcript ထုတ်နေသည်…")
+        chunks_dir = folder / "audio-chunks"
+        chunks_dir.mkdir(exist_ok=True)
+        _run([ffmpeg, "-y", "-i", str(audio_path), "-f", "segment", "-segment_time", "480", "-reset_timestamps", "1", "-c", "copy", str(chunks_dir / "chunk-%03d.mp3")])
+        audio_chunks = sorted(chunks_dir.glob("chunk-*.mp3"))
         segments = []
-        for item in raw_segments:
-            get = item.get if isinstance(item, dict) else lambda k, d=None: getattr(item, k, d)
-            txt = str(get("text", "")).strip()
-            if txt:
-                segments.append({"start": float(get("start", 0)), "end": float(get("end", 0)), "text": txt})
+        for chunk_index, chunk_path in enumerate(audio_chunks):
+            with chunk_path.open("rb") as af:
+                transcript = client.audio.transcriptions.create(file=(chunk_path.name, af.read()), model=STT_MODEL, response_format="verbose_json", timestamp_granularities=["segment"])
+            raw_segments = getattr(transcript, "segments", None) or []
+            chunk_segments = []
+            for item in raw_segments:
+                get = item.get if isinstance(item, dict) else lambda k, d=None: getattr(item, k, d)
+                txt = str(get("text", "")).strip()
+                if txt:
+                    chunk_segments.append({"start": chunk_index * 480 + float(get("start", 0)), "end": chunk_index * 480 + float(get("end", 0)), "text": txt})
+            if not chunk_segments:
+                full_text = str(getattr(transcript, "text", "")).strip()
+                if full_text:
+                    chunk_segments.append({"start": chunk_index * 480, "end": chunk_index * 480 + 5.0, "text": full_text})
+            segments.extend(chunk_segments)
+            _set_job(job_id, min(35, 22 + int(13 * (chunk_index + 1) / max(1, len(audio_chunks)))), f"Transcript အပိုင်း {chunk_index+1}/{len(audio_chunks)}")
         if not segments:
-            full_text = str(getattr(transcript, "text", "")).strip()
-            if not full_text:
-                raise RuntimeError("Transcript မရပါ။ အသံပါသော video နဲ့ ပြန်စမ်းပါ။")
-            segments = [{"start": 0.0, "end": 5.0, "text": full_text}]
+            raise RuntimeError("Transcript မရပါ။ အသံပါသော video နဲ့ ပြန်စမ်းပါ။")
         original_srt = folder / "original.srt"
         _write_srt(segments, original_srt)
         _set_job(job_id, 38, "Original SRT ထုတ်ပြီးပါပြီ။ မြန်မာဘာသာပြန်နေသည်…")
